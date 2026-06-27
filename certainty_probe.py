@@ -172,25 +172,31 @@ def init_db():
             window_key TEXT, asset TEXT, tf INTEGER, secs_left INTEGER,
             binance_move REAL, chainlink_move REAL, bin_minus_cl REAL,
             realized_vol REAL, flip_count INTEGER, secs_since_flip INTEGER,
+            hold_instab REAL,
             poly_ask REAL, poly_bid REAL, poly_mid REAL, poly_depth99 REAL, book_age INTEGER,
             binance_dir TEXT, settled_outcome TEXT, correct INTEGER
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_win ON samples(window_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_set ON samples(settled_outcome)")
+    # Migration: add hold_instab to pre-existing tables that don't have it.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(samples)").fetchall()]
+    if "hold_instab" not in cols:
+        conn.execute("ALTER TABLE samples ADD COLUMN hold_instab REAL")
+        log.info("[db] migrated: added hold_instab column")
     conn.commit(); conn.close()
 
 def db_insert(row):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""INSERT INTO samples
         (window_key, asset, tf, secs_left, binance_move, chainlink_move, bin_minus_cl,
-         realized_vol, flip_count, secs_since_flip,
+         realized_vol, flip_count, secs_since_flip, hold_instab,
          poly_ask, poly_bid, poly_mid, poly_depth99, book_age,
          binance_dir, settled_outcome, correct)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""",
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""",
         (row["window_key"], row["asset"], row["tf"], row["secs_left"],
          row["binance_move"], row["chainlink_move"], row["bin_minus_cl"],
-         row["realized_vol"], row["flip_count"], row["secs_since_flip"],
+         row["realized_vol"], row["flip_count"], row["secs_since_flip"], row.get("hold_instab"),
          row["poly_ask"], row["poly_bid"], row["poly_mid"], row["poly_depth99"], row["book_age"],
          row["binance_dir"]))
     conn.commit(); conn.close()
@@ -311,6 +317,44 @@ def realized_vol(asset, lookback=VOL_LOOKBACK_SECS):
         p0 = pts[i-1][1]
         if p0 > 0: rets.append((pts[i][1]-p0)/p0*100)
     return math.sqrt(sum(r*r for r in rets)) if rets else 0.0
+
+def hold_instability(asset, open_price, lookback=60):
+    """THE THING SAVIO ACTUALLY ASKED FOR.
+    Look at the move-from-open — (price - open) — every second over the LAST
+    `lookback` seconds. Measure whether that sequence HOLDS STEADY (good) or is
+    DECAYING / SWINGING (bad). Both decay and swing are bad:
+      - decay: the move sliding back toward zero (e.g. +100 -> +40 -> +30),
+               i.e. reverting toward the open and about to flip.
+      - swing: the move bouncing erratically (e.g. +100 -> +40 -> +90 -> +30).
+    We capture BOTH in one score: how far the diff sequence deviates from simply
+    holding flat at its most-recent level. A move that sits at 100,98,102,99
+    scores LOW (steady, good). One that goes 100,40,90,30 scores HIGH (decaying
+    AND swinging, bad). Score is in % of price (same units as the move), so it's
+    comparable across assets. Returns 0.0 if not enough ticks.
+    """
+    if not open_price or open_price <= 0:
+        return None
+    ticks = _snap(asset)
+    if len(ticks) < 3:
+        return None
+    now = time.time()
+    cut = now - lookback
+    # one diff-from-open value per second over the lookback (use the last tick
+    # in each 1-second bucket so we get an evenly-spaced sequence)
+    by_sec = {}
+    for (t, p) in ticks:
+        if t >= cut and p > 0:
+            by_sec[int(t)] = (p - open_price) / open_price * 100.0  # diff in %
+    diffs = [by_sec[s] for s in sorted(by_sec.keys())]
+    if len(diffs) < 3:
+        return None
+    # "Holding steady at its level" = staying near the most-recent diff value.
+    # Deviation from that level penalizes BOTH a downward slide (decay) and
+    # erratic bouncing (swing) in a single number.
+    level = diffs[-1]  # where the move currently sits
+    # mean absolute deviation of the whole recent sequence from that level
+    mad = sum(abs(d - level) for d in diffs) / len(diffs)
+    return round(mad, 4)
 
 def flip_count(asset, lookback=30):
     ticks = _snap(asset)
@@ -512,6 +556,7 @@ def sampler_loop():
                     bmc = (b_move - c_move) if c_move is not None else None
                     rv = realized_vol(asset)
                     fc = flip_count(asset, 30)
+                    hinstab = hold_instability(asset, b_open, 60)  # move-from-open stability, last 60s
                     b_dir = "UP" if b_move >= 0 else "DOWN"
 
                     pa = pb = pm = pd = None; bage = None
@@ -528,6 +573,7 @@ def sampler_loop():
                         "window_key": wk, "asset": asset, "tf": tf, "secs_left": secs_left,
                         "binance_move": r(b_move), "chainlink_move": r(c_move), "bin_minus_cl": r(bmc),
                         "realized_vol": r(rv), "flip_count": fc, "secs_since_flip": secs_since_flip,
+                        "hold_instab": hinstab,
                         "poly_ask": r(pa), "poly_bid": r(pb), "poly_mid": r(pm),
                         "poly_depth99": r(pd, 2), "book_age": bage, "binance_dir": b_dir,
                     })
@@ -732,6 +778,63 @@ def build_calm_report(asset):
     return "\n".join(out)
 
 
+def build_hold_report(asset):
+    """THE MOVE-HOLD TEST (what Savio actually asked for).
+    For each settled window, hold_instab = how much the move-from-open
+    DECAYED or SWUNG over the last 60s before each sample (low = the move held
+    steady; high = it slid toward zero or bounced around). This buckets windows
+    by that instability and shows WIN% per bucket. If steady (low instab) windows
+    win more and unstable (high instab) windows lose, then the move-hold signal
+    is real — gate the bot to only enter when the move is holding steady."""
+    if asset not in ASSET_LIST:
+        return f"Unknown asset '{asset}'. Try: {', '.join(ASSET_LIST)}"
+    # instability buckets in % (same units as the move). Low = steady/good.
+    buckets = [
+        ("rock steady (under 0.01)", 0.0,   0.01),
+        ("steady      (0.01-0.03)",  0.01,  0.03),
+        ("drifting    (0.03-0.06)",  0.03,  0.06),
+        ("unstable    (0.06-0.12)",  0.06,  0.12),
+        ("wild        (over 0.12)",  0.12,  99.0),
+    ]
+    em = ASSET_EMOJI.get(asset, "")
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    diag = c.execute(
+        """SELECT
+             SUM(CASE WHEN settled_outcome IS NOT NULL THEN 1 ELSE 0 END),
+             SUM(CASE WHEN settled_outcome IS NOT NULL AND hold_instab IS NOT NULL THEN 1 ELSE 0 END)
+           FROM samples WHERE asset=?""", (asset,)).fetchone()
+    n_settled = diag[0] or 0
+    n_h = diag[1] or 0
+    out = [f"📉 <b>{em} {asset} — WIN% by move-hold</b>",
+           "<i>does a STEADY move-from-open win more? (last 60s)</i>",
+           f"<i>settled:{n_settled} · w/ hold:{n_h}</i>"]
+    if n_h == 0:
+        out.append("\n⚠️ No hold_instab data yet — this is gathered going forward.")
+        out.append("Let it run and re-check /hold in a day.")
+        out.append(f"\n🕐 {est_str()}")
+        conn.close()
+        return "\n".join(out)
+    for tf in (5, 15):
+        out.append(f"\n<b>━━ {asset} {tf}m ━━</b>")
+        for label, lo, hi in buckets:
+            rows = c.execute(
+                """SELECT correct FROM samples
+                   WHERE settled_outcome IS NOT NULL AND asset=? AND tf=?
+                     AND hold_instab >= ? AND hold_instab < ?""",
+                (asset, tf, lo, hi)).fetchall()
+            n = len(rows)
+            if n == 0:
+                continue
+            win = sum(x[0] for x in rows) / n * 100
+            flag = "✅" if win >= 99 else ("·" if win >= 97 else "⚠️")
+            out.append(f" {flag} {label}: {win:.1f}% ({n})")
+    conn.close()
+    out.append("\n<i>✅ beats 99¢ · ⚠️ loses. If steady rows win and wild rows")
+    out.append("lose, gate entry to only when the move is holding steady.</i>")
+    out.append(f"\n🕐 {est_str()}")
+    return "\n".join(out)
+
+
 def build_grid_report(asset):
     """Per-ASSET lock frontier, split by timeframe (5m and 15m) and time-left band.
     This is the measured per-market-per-timeframe surface (replaces guessed
@@ -913,6 +1016,10 @@ def command_worker():
                         parts = text.split()
                         asset = parts[1].upper() if len(parts) > 1 else "BTC"
                         tg(build_calm_report(asset))
+                    elif text.startswith("/hold"):
+                        parts = text.split()
+                        asset = parts[1].upper() if len(parts) > 1 else "BTC"
+                        tg(build_hold_report(asset))
                     elif text == "/markets":
                         tg(build_markets_live())
                     elif text == "/frontier":
