@@ -127,7 +127,32 @@ def est_str():
     return est_now().strftime("%H:%M EST")
 
 # ─── DB ──────────────────────────────────────────────────────────────────────
+def _ensure_db_path():
+    """Make sure the directory holding the DB exists. On Railway, a volume
+    mounted at /data should provide it, but if the mount is missing at runtime
+    (a known Railway quirk where the volume shows 'attached' but isn't mounted
+    in the container), creating the dir lets the probe still start instead of
+    crash-looping on 'unable to open database file'. If even that fails (e.g.
+    no write permission at the mount root), fall back to a local file so the
+    probe runs — data won't persist, but it won't crash."""
+    global DB_PATH
+    d = os.path.dirname(DB_PATH)
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            log.warning(f"[db] could not create dir {d}: {e} — falling back to local file")
+            DB_PATH = os.path.basename(DB_PATH) or "certainty_probe.db"
+    # Final guard: verify we can actually open it; if not, fall back to local.
+    try:
+        _c = sqlite3.connect(DB_PATH); _c.close()
+    except Exception as e:
+        log.warning(f"[db] cannot open {DB_PATH}: {e} — falling back to local file")
+        DB_PATH = "certainty_probe.db"
+
 def init_db():
+    _ensure_db_path()
+    log.info(f"[db] using database at: {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS samples (
