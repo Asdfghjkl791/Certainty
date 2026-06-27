@@ -109,12 +109,24 @@ def tg(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.info(f"[TG-disabled] {msg[:120]}")
         return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-                      timeout=8)
+        r = requests.post(url,
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                          timeout=8)
+        # Telegram returns HTTP 400 (NOT an exception) when HTML parsing fails —
+        # e.g. a stray '<' or '>' in the text. In that case the message is silently
+        # dropped. Detect it and retry as plain text so the message still arrives.
+        if r.status_code != 200:
+            log.warning(f"[TG] HTML send failed ({r.status_code}): {r.text[:200]} — retrying plain")
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=8)
     except Exception as e:
         log.error(f"TG error: {e}")
+        # Last-ditch: try plain text with no parse mode.
+        try:
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=8)
+        except Exception:
+            pass
 
 def est_now():
     try:
@@ -649,14 +661,14 @@ def build_calm_report(asset):
     # Calm buckets by realized_vol (lower = calmer). Edges chosen to spread the
     # mass; the report shows counts so you can see if a bucket is too thin.
     vol_buckets = [
-        ("very calm  (rv<0.02)",  0.0,   0.02),
+        ("very calm  (rv under 0.02)",  0.0,   0.02),
         ("calm       (0.02-0.04)",0.02,  0.04),
         ("moderate   (0.04-0.07)",0.04,  0.07),
         ("choppy     (0.07-0.12)",0.07,  0.12),
-        ("very choppy(rv>0.12)",  0.12,  9.99),
+        ("very choppy(rv over 0.12)",  0.12,  9.99),
     ]
     flip_buckets = [
-        ("steady (<=4 flips)",   0,  5),
+        ("steady (0-4 flips)",   0,  5),
         ("some   (5-9 flips)",   5,  10),
         ("choppy (10-15 flips)", 10, 16),
         ("wild   (16+ flips)",   16, 9999),
