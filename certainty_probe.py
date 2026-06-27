@@ -886,6 +886,8 @@ def command_worker():
                 if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID):
                     continue
                 text = (msg.get("text", "") or "").strip().lower()
+                if text:
+                    log.info(f"[cmd received] {text!r}")
                 try:
                     if text == "/book":
                         tg(build_book_report())
@@ -895,7 +897,7 @@ def command_worker():
                         parts = text.split()
                         asset = parts[1].upper() if len(parts) > 1 else "BTC"
                         tg(build_grid_report(asset))
-                    elif text.startswith("/calm"):
+                    elif text.startswith("/vol"):
                         parts = text.split()
                         asset = parts[1].upper() if len(parts) > 1 else "BTC"
                         tg(build_calm_report(asset))
