@@ -886,37 +886,44 @@ def command_worker():
                 if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID):
                     continue
                 text = (msg.get("text", "") or "").strip().lower()
-                if text == "/book":
-                    tg(build_book_report())
-                elif text == "/split":
-                    tg(build_split_report())
-                elif text.startswith("/grid"):
-                    parts = text.split()
-                    asset = parts[1].upper() if len(parts) > 1 else "BTC"
-                    tg(build_grid_report(asset))
-                elif text.startswith("/calm"):
-                    parts = text.split()
-                    asset = parts[1].upper() if len(parts) > 1 else "BTC"
-                    tg(build_calm_report(asset))
-                elif text == "/markets":
-                    tg(build_markets_live())
-                elif text == "/frontier":
-                    # reuse the report body by triggering one immediately
-                    try:
+                try:
+                    if text == "/book":
+                        tg(build_book_report())
+                    elif text == "/split":
+                        tg(build_split_report())
+                    elif text.startswith("/grid"):
+                        parts = text.split()
+                        asset = parts[1].upper() if len(parts) > 1 else "BTC"
+                        tg(build_grid_report(asset))
+                    elif text.startswith("/calm"):
+                        parts = text.split()
+                        asset = parts[1].upper() if len(parts) > 1 else "BTC"
+                        tg(build_calm_report(asset))
+                    elif text == "/markets":
+                        tg(build_markets_live())
+                    elif text == "/frontier":
+                        # reuse the report body by triggering one immediately
                         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
                         c.execute("SELECT COUNT(*) FROM samples WHERE settled_outcome IS NOT NULL")
                         n = c.fetchone()[0]; conn.close()
                         tg(f"Frontier report runs hourly. {n} settled samples so far. "
                            f"(Use the latest hourly LOCK FRONTIER message.)")
-                    except Exception as e:
-                        tg(f"frontier: {e}")
-                elif text == "/status":
-                    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-                    c.execute("SELECT COUNT(*), SUM(CASE WHEN settled_outcome IS NOT NULL THEN 1 ELSE 0 END), "
-                              "SUM(CASE WHEN poly_ask IS NOT NULL THEN 1 ELSE 0 END) FROM samples")
-                    tot, settled, withbook = c.fetchone(); conn.close()
-                    tg(f"🧪 Probe status\nSamples: {tot or 0}\nSettled: {settled or 0}\n"
-                       f"With book: {withbook or 0}\n🕐 {est_str()}")
+                    elif text == "/status":
+                        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+                        c.execute("SELECT COUNT(*), SUM(CASE WHEN settled_outcome IS NOT NULL THEN 1 ELSE 0 END), "
+                                  "SUM(CASE WHEN poly_ask IS NOT NULL THEN 1 ELSE 0 END) FROM samples")
+                        tot, settled, withbook = c.fetchone(); conn.close()
+                        tg(f"🧪 Probe status\nSamples: {tot or 0}\nSettled: {settled or 0}\n"
+                           f"With book: {withbook or 0}\n🕐 {est_str()}")
+                except Exception as cmd_err:
+                    # Report the error back over Telegram instead of swallowing it,
+                    # so a failing command is visible instead of silent.
+                    import traceback as _tb
+                    log.warning(f"[cmd handler] {cmd_err}\n{_tb.format_exc()}")
+                    try:
+                        tg(f"⚠️ command '{text}' errored: {type(cmd_err).__name__}: {cmd_err}")
+                    except Exception:
+                        pass
         except Exception as e:
             log.warning(f"[cmd] {e}")
             time.sleep(3)
