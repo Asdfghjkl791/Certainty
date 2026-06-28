@@ -1069,27 +1069,35 @@ def build_split_report():
     return "\n".join(L)
 
 
-def build_wobble_report():
+def build_wobble_report(asset=None):
     """THE METRIC SHOOTOUT: at the marginal zones where the bot loses, compare all
     three chaos measures (jitter, CHOP, KER) between WINNING and LOSING windows.
     Whichever shows the biggest, most consistent gap between winners and losers is
     the one actually worth gating on. If none separate them, no wobble filter helps
-    — same logic as /split, but head-to-head across the three candidates."""
+    — same logic as /split, but head-to-head across the three candidates.
+    Pass an asset (e.g. /wobble BTC) to see ONE market — recommended, since coins
+    behave differently and the bot gates per-market. No asset = all pooled."""
+    if asset is not None and asset not in ASSET_LIST:
+        return f"Unknown asset '{asset}'. Try: {', '.join(ASSET_LIST)}"
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     zones = [
         ("small move, buzzer (0.03-0.08%, 0-20s)", 0.03, 0.08, 0, 20),
         ("small move, 20-40s (0.04-0.10%)",        0.04, 0.10, 20, 40),
         ("moderate move, early (0.08-0.20%, 40-70s)", 0.08, 0.20, 40, 70),
     ]
-    L = ["🌀 <b>WOBBLE SHOOTOUT — jitter vs CHOP vs KER</b>",
-         "<i>which one separates winners from losers? (loser value should differ)</i>",
+    scope = f"{ASSET_EMOJI.get(asset,'')} {asset}" if asset else "ALL markets"
+    L = [f"🌀 <b>WOBBLE SHOOTOUT — {scope}</b>",
+         "<i>jitter vs CHOP vs KER: which separates winners from losers?</i>",
          "<i>jitter/CHOP: losers HIGHER · KER: losers LOWER</i>", ""]
+    # asset filter fragment + params helper
+    asset_sql = " AND asset=?" if asset else ""
     diag = c.execute(
-        """SELECT
+        f"""SELECT
              SUM(CASE WHEN settled_outcome IS NOT NULL AND jitter IS NOT NULL THEN 1 ELSE 0 END),
              SUM(CASE WHEN settled_outcome IS NOT NULL AND chop IS NOT NULL THEN 1 ELSE 0 END),
              SUM(CASE WHEN settled_outcome IS NOT NULL AND ker IS NOT NULL THEN 1 ELSE 0 END)
-           FROM samples""").fetchone()
+           FROM samples WHERE 1=1{asset_sql}""",
+        ((asset,) if asset else ())).fetchone()
     L.append(f"<i>settled w/ jitter:{diag[0] or 0} · chop:{diag[1] or 0} · ker:{diag[2] or 0}</i>")
     if (diag[0] or 0) == 0:
         L.append("\n⚠️ No jitter/chop/ker data yet — gathered going forward.")
@@ -1100,12 +1108,12 @@ def build_wobble_report():
     L.append("")
     for label, mlo, mhi, slo, shi in zones:
         rows = c.execute(
-            """SELECT correct, jitter, chop, ker FROM samples
+            f"""SELECT correct, jitter, chop, ker FROM samples
                WHERE settled_outcome IS NOT NULL
-                 AND jitter IS NOT NULL
+                 AND jitter IS NOT NULL{asset_sql}
                  AND ABS(binance_move) >= ? AND ABS(binance_move) < ?
                  AND secs_left >= ? AND secs_left < ?""",
-            (mlo, mhi, slo, shi)).fetchall()
+            (((asset,) if asset else ()) + (mlo, mhi, slo, shi))).fetchall()
         if not rows:
             L.append(f"<b>{label}</b>\n  no samples yet\n")
             continue
@@ -1210,8 +1218,10 @@ def command_worker():
                         tg(build_book_report())
                     elif text == "/split":
                         tg(build_split_report())
-                    elif text == "/wobble":
-                        tg(build_wobble_report())
+                    elif text.startswith("/wobble"):
+                        parts = text.split()
+                        wb_asset = parts[1].upper() if len(parts) > 1 else None
+                        tg(build_wobble_report(wb_asset))
                     elif text.startswith("/grid"):
                         parts = text.split()
                         asset = parts[1].upper() if len(parts) > 1 else "BTC"
