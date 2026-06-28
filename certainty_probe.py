@@ -1153,83 +1153,111 @@ def build_wobble_report(asset=None):
 
 
 def build_past_threshold_report(asset=None):
-    """THE RIGHT TEST (Savio's idea): only look at windows that ALREADY CLEARED the
-    move threshold — i.e. trades the bot would actually take — then bucket THOSE by
-    chaos (jitter/CHOP/KER) and show win%. Every prior report mixed in tiny-move
-    calm windows that lose for a different reason (small move), which made chaos
-    look backwards. By first filtering to past-threshold windows, move size is held
-    roughly constant, so we finally see whether — AMONG REAL TRADES — the choppy
-    ones lose more than the smooth ones. If they do, a chaos filter helps. If not,
-    it's settled: chaos adds nothing beyond the move×time gate.
+    """ENTRY SIMULATION (the real test). For each settled window, find the ENTRY
+    sample — the first second (scanning from most time-left toward the close) where
+    the move crossed the gate, i.e. the moment the bot would commit. Lock the
+    direction AND the jitter at that entry moment. Then check the window's actual
+    settled outcome: did the move HOLD (entry direction == outcome = win) or REVERSE
+    after entry (entry direction != outcome = loss)?
 
-    'Past threshold' here = the move cleared a per-time-left bar (approximating the
-    bot's frontier): >=0.10% at <=20s, >=0.10% at 20-40s, >=0.20% at 40-70s,
-    >=0.40% at 70-120s. Tunable, but this matches the measured lock frontier."""
+    This is what the old version couldn't do: it catches reversals AFTER entry — the
+    thing that actually loses a 99¢ trade. Then it buckets entries by their
+    entry-jitter and shows win%, and compares the jitter of REVERSED trades vs
+    survivors. If reversed trades were choppier at entry, a chaos filter would help.
+    If they look the same, chaos is dead even post-entry — losses are timing/luck."""
     if asset is not None and asset not in ASSET_LIST:
         return f"Unknown asset '{asset}'. Try: {', '.join(ASSET_LIST)}"
-    # per-time-left move bar (the "would the bot trade this" gate, measured frontier)
-    # (max_secs_left, min_abs_move%)
-    gate = [(20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)]
-    # SQL CASE that picks the bar for each row's secs_left
-    gate_sql = """
-        ABS(binance_move) >= (CASE
-            WHEN secs_left <= 20 THEN 0.10
-            WHEN secs_left <= 40 THEN 0.10
-            WHEN secs_left <= 70 THEN 0.20
-            ELSE 0.40 END)
-        AND secs_left <= 120 AND secs_left >= 0
-    """
+    # gate: min |move| by time-left band (the bot's commit rule)
+    def gate_for(sl):
+        if sl <= 20: return 0.10
+        if sl <= 40: return 0.10
+        if sl <= 70: return 0.20
+        return 0.40
     asset_sql = " AND asset=?" if asset else ""
     scope = f"{ASSET_EMOJI.get(asset,'')} {asset}" if asset else "ALL markets"
-    # jitter buckets (the metric that won Savio's shape test). Tunable edges.
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+
+    # Pull all settled samples (optionally one asset), ordered so we can walk each
+    # window from most-time-left to least and find the first gate crossing.
+    rows = c.execute(
+        f"""SELECT window_key, tf, secs_left, binance_move, jitter, settled_outcome
+            FROM samples
+            WHERE settled_outcome IS NOT NULL AND binance_move IS NOT NULL
+              AND secs_left >= 0 AND secs_left <= 120{asset_sql}
+            ORDER BY window_key, secs_left DESC""",
+        ((asset,) if asset else ())).fetchall()
+    conn.close()
+
+    # Group by window, find entry = first row (highest secs_left first) past gate.
+    entries = {}   # window_key -> dict(tf, entry_jitter, won)
+    cur_wk = None
+    for wk, tf, sl, move, jit, outcome in rows:
+        if wk in entries:
+            continue  # already have this window's entry
+        if move is None:
+            continue
+        need = gate_for(sl)
+        if abs(move) >= need:
+            entry_dir = "UP" if move >= 0 else "DOWN"
+            won = (entry_dir == outcome)
+            entries[wk] = {"tf": tf, "jit": jit, "won": won}
+
+    if not entries:
+        return (f"🎯 <b>ENTRY-SIM by chaos — {scope}</b>\n"
+                "<i>no settled windows crossed the gate yet — gathering.</i>\n"
+                f"🕐 {est_str()}")
+
+    total = len(entries)
+    reversed_n = sum(1 for e in entries.values() if not e["won"])
+    rev_pct = reversed_n / total * 100
+
+    out = [f"🎯 <b>ENTRY-SIM by chaos — {scope}</b>",
+           "<i>enter at 99¢ when move first crosses gate, then check if it HELD</i>",
+           f"<i>entries: {total} · reversed after entry: {reversed_n} ({rev_pct:.1f}%)</i>"]
+
     jit_buckets = [
         ("calm    (jit under 0.15)", 0.0,  0.15),
         ("mild    (0.15-0.30)",       0.15, 0.30),
         ("choppy  (0.30-0.60)",       0.30, 0.60),
         ("wild    (over 0.60)",       0.60, 999),
     ]
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    out = [f"🎯 <b>PAST-THRESHOLD chaos — {scope}</b>",
-           "<i>only windows the bot would TRADE (move cleared gate),</i>",
-           "<i>then bucketed by jitter. does choppy lose AMONG real trades?</i>"]
-    # how many past-threshold settled rows exist?
-    base_params = ((asset,) if asset else ())
-    n_pt = c.execute(
-        f"""SELECT COUNT(*) FROM samples
-            WHERE settled_outcome IS NOT NULL AND jitter IS NOT NULL{asset_sql}
-              AND {gate_sql}""", base_params).fetchone()[0]
-    out.append(f"<i>past-threshold settled w/ jitter: {n_pt}</i>")
-    if n_pt == 0:
-        out.append("\n⚠️ No past-threshold rows with jitter yet.")
-        out.append("Needs windows that cleared the gate AND have the new jitter")
-        out.append("column (gathered going forward). Re-check in a day.")
-        out.append(f"\n🕐 {est_str()}")
-        conn.close()
-        return "\n".join(out)
     for tf in (5, 15):
-        out.append(f"\n<b>━━ {asset or 'ALL'} {tf}m · past-threshold ━━</b>")
+        out.append(f"\n<b>━━ {asset or 'ALL'} {tf}m · win% by jitter at entry ━━</b>")
         any_rows = False
         for label, lo, hi in jit_buckets:
-            rows = c.execute(
-                f"""SELECT correct FROM samples
-                    WHERE settled_outcome IS NOT NULL AND jitter IS NOT NULL{asset_sql}
-                      AND tf=? AND {gate_sql}
-                      AND jitter >= ? AND jitter < ?""",
-                (base_params + (tf, lo, hi))).fetchall()
-            n = len(rows)
+            es = [e for e in entries.values()
+                  if e["tf"] == tf and e["jit"] is not None and lo <= e["jit"] < hi]
+            n = len(es)
             if n == 0:
                 continue
             any_rows = True
-            win = sum(r[0] for r in rows) / n * 100
+            win = sum(1 for e in es if e["won"]) / n * 100
             flag = "✅" if win >= 99 else ("·" if win >= 97 else "⚠️")
             out.append(f" {flag} {label}: {win:.1f}% ({n})")
         if not any_rows:
-            out.append(" (no past-threshold samples yet)")
-    conn.close()
-    out.append("\n<i>KEY READ: these are all BIG-ENOUGH moves (past the gate), so")
-    out.append("move size is controlled. If win% now DROPS as jitter rises, chaos")
-    out.append("is a real independent signal — gate it. If win% is flat/climbs,")
-    out.append("chaos adds nothing beyond move×time (settled).</i>")
+            out.append(" (no entries with jitter yet)")
+
+    # The losses: were reversed trades choppier at entry than survivors?
+    rev = [e["jit"] for e in entries.values() if not e["won"] and e["jit"] is not None]
+    surv = [e["jit"] for e in entries.values() if e["won"] and e["jit"] is not None]
+    if len(rev) >= 5 and surv:
+        avg_rev = sum(rev) / len(rev)
+        avg_surv = sum(surv) / len(surv)
+        out.append(f"\n<b>━━ the losses ━━</b>")
+        out.append(f" {len(rev)} reversals: avg jitter {avg_rev:.3f} vs survivors {avg_surv:.3f}")
+        if avg_surv > 0:
+            gap = (avg_rev - avg_surv) / avg_surv * 100
+            if gap > 25:
+                out.append(f" → losers ARE choppier at entry ({gap:+.0f}%) — chaos filter MIGHT help ✅")
+            elif gap < -25:
+                out.append(f" → losers are CALMER at entry ({gap:+.0f}%) — chaos filter backwards ✗")
+            else:
+                out.append(f" → losers ≈ survivors ({gap:+.0f}%) — chaos doesn't separate them ✗")
+    else:
+        out.append(f"\n<i>too few reversals ({len(rev)}) to judge the chaos split yet</i>")
+
+    out.append("\n<i>This catches post-entry reversals (real trade risk). If choppy")
+    out.append("entries reverse more, a chaos filter helps. If not, losses are timing.</i>")
     out.append(f"\n🕐 {est_str()}")
     return "\n".join(out)
 
