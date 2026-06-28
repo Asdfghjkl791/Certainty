@@ -173,8 +173,10 @@ def init_db():
             binance_move REAL, chainlink_move REAL, bin_minus_cl REAL,
             realized_vol REAL, flip_count INTEGER, secs_since_flip INTEGER,
             hold_instab REAL,
+            jitter REAL, chop REAL, ker REAL,
             poly_ask REAL, poly_bid REAL, poly_mid REAL, poly_depth99 REAL, book_age INTEGER,
-            binance_dir TEXT, settled_outcome TEXT, correct INTEGER
+            binance_dir TEXT, settled_outcome TEXT, correct INTEGER,
+            ins_ts REAL
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_win ON samples(window_key)")
@@ -184,6 +186,13 @@ def init_db():
     if "hold_instab" not in cols:
         conn.execute("ALTER TABLE samples ADD COLUMN hold_instab REAL")
         log.info("[db] migrated: added hold_instab column")
+    if "ins_ts" not in cols:
+        conn.execute("ALTER TABLE samples ADD COLUMN ins_ts REAL")
+        log.info("[db] migrated: added ins_ts column")
+    for newcol in ("jitter", "chop", "ker"):
+        if newcol not in cols:
+            conn.execute(f"ALTER TABLE samples ADD COLUMN {newcol} REAL")
+            log.info(f"[db] migrated: added {newcol} column")
     conn.commit(); conn.close()
 
 def db_insert(row):
@@ -191,14 +200,16 @@ def db_insert(row):
     conn.execute("""INSERT INTO samples
         (window_key, asset, tf, secs_left, binance_move, chainlink_move, bin_minus_cl,
          realized_vol, flip_count, secs_since_flip, hold_instab,
+         jitter, chop, ker,
          poly_ask, poly_bid, poly_mid, poly_depth99, book_age,
-         binance_dir, settled_outcome, correct)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""",
+         binance_dir, settled_outcome, correct, ins_ts)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?)""",
         (row["window_key"], row["asset"], row["tf"], row["secs_left"],
          row["binance_move"], row["chainlink_move"], row["bin_minus_cl"],
          row["realized_vol"], row["flip_count"], row["secs_since_flip"], row.get("hold_instab"),
+         row.get("jitter"), row.get("chop"), row.get("ker"),
          row["poly_ask"], row["poly_bid"], row["poly_mid"], row["poly_depth99"], row["book_age"],
-         row["binance_dir"]))
+         row["binance_dir"], time.time()))
     conn.commit(); conn.close()
 
 def db_label(window_key, outcome):
@@ -355,6 +366,70 @@ def hold_instability(asset, open_price, lookback=60):
     # mean absolute deviation of the whole recent sequence from that level
     mad = sum(abs(d - level) for d in diffs) / len(diffs)
     return round(mad, 4)
+
+
+def _recent_sequence(asset, lookback):
+    """Helper: evenly-spaced 1-per-second price sequence over the last `lookback`
+    seconds (last tick in each 1s bucket). Shared by jitter/chop/ker."""
+    ticks = _snap(asset)
+    if len(ticks) < 3:
+        return None
+    now = time.time()
+    cut = now - lookback
+    by_sec = {}
+    for (t, p) in ticks:
+        if t >= cut and p > 0:
+            by_sec[int(t)] = p
+    seq = [by_sec[s] for s in sorted(by_sec.keys())]
+    return seq if len(seq) >= 3 else None
+
+
+def jitter_measure(asset, open_price, lookback=60):
+    """TOTAL JITTER: sum of all second-to-second price moves over the last
+    `lookback` seconds, as % of price. Captures BOTH big and frequent wobble —
+    big jumps add a lot, and many small jumps still add up (can't be dodged by
+    staying 'just under' a per-jump threshold). Higher = more wobble. The measure
+    that matched Savio's 10 hand-checked shapes best. None if not enough ticks."""
+    if not open_price or open_price <= 0:
+        return None
+    seq = _recent_sequence(asset, lookback)
+    if not seq:
+        return None
+    total = sum(abs(seq[i+1] - seq[i]) for i in range(len(seq)-1))
+    return round(total / open_price * 100.0, 4)
+
+
+def chop_measure(asset, lookback=60):
+    """CHOPPINESS INDEX (Dreiss), 0-100. High = choppy/sideways, low = trending.
+    CHOP = 100 * LOG10( SUM(|step|) / (max-min) ) / LOG10(n). Normalized, so it
+    can't blow up on calm markets the way a raw ratio does. Catches sideways
+    whipsaw well; tends to MISS violent one-way spikes (they look 'trending').
+    None if not enough ticks or zero range."""
+    seq = _recent_sequence(asset, lookback)
+    if not seq:
+        return None
+    tr_sum = sum(abs(seq[i+1] - seq[i]) for i in range(len(seq)-1))
+    hi, lo = max(seq), min(seq)
+    rng = hi - lo
+    n = len(seq) - 1
+    if rng <= 0 or tr_sum <= 0 or n < 2:
+        return None
+    return round(100 * math.log10(tr_sum / rng) / math.log10(n), 2)
+
+
+def ker_measure(asset, lookback=60):
+    """KAUFMAN EFFICIENCY RATIO, 0-1. High = clean efficient trend, low = noisy.
+    KER = |net change| / sum of |steps|. Catches violent one-way spikes (low-ish,
+    since they thrash) better than CHOP; but tends to flag CALM-FLAT markets as
+    noisy (net~0 -> ratio~0). Opposite blind spot from CHOP. None if no movement."""
+    seq = _recent_sequence(asset, lookback)
+    if not seq:
+        return None
+    net = abs(seq[-1] - seq[0])
+    vol = sum(abs(seq[i+1] - seq[i]) for i in range(len(seq)-1))
+    if vol <= 0:
+        return None
+    return round(net / vol, 4)
 
 def flip_count(asset, lookback=30):
     ticks = _snap(asset)
@@ -557,6 +632,9 @@ def sampler_loop():
                     rv = realized_vol(asset)
                     fc = flip_count(asset, 30)
                     hinstab = hold_instability(asset, b_open, 60)  # move-from-open stability, last 60s
+                    jit = jitter_measure(asset, b_open, 60)        # total jitter (best vs Savio's shapes)
+                    chp = chop_measure(asset, 60)                  # choppiness index 0-100
+                    kr = ker_measure(asset, 60)                    # kaufman efficiency ratio 0-1
                     b_dir = "UP" if b_move >= 0 else "DOWN"
 
                     pa = pb = pm = pd = None; bage = None
@@ -574,6 +652,7 @@ def sampler_loop():
                         "binance_move": r(b_move), "chainlink_move": r(c_move), "bin_minus_cl": r(bmc),
                         "realized_vol": r(rv), "flip_count": fc, "secs_since_flip": secs_since_flip,
                         "hold_instab": hinstab,
+                        "jitter": jit, "chop": chp, "ker": kr,
                         "poly_ask": r(pa), "poly_bid": r(pb), "poly_mid": r(pm),
                         "poly_depth99": r(pd, 2), "book_age": bage, "binance_dir": b_dir,
                     })
@@ -587,6 +666,49 @@ MOVE_BANDS = [(0.0, 0.02), (0.02, 0.05), (0.05, 0.10), (0.10, 0.20), (0.20, 0.40
 
 def ev_per_dollar(hold):
     return hold * 0.01 - (1 - hold) * 0.99
+
+def build_hourly_digest():
+    """LAST-HOUR pulse, all assets. Shows the past hour's settled windows only,
+    summarizing win% by move-hold stability (steady vs unstable) and by
+    volatility. The long-term data keeps accumulating in the DB for the
+    full-history /hold and /vol commands — this is just the recent snapshot."""
+    cutoff = time.time() - 3600  # last hour
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    L = ["⏱️ <b>LAST HOUR · per asset</b>",
+         "<i>recent pulse — full history via /hold /vol /grid</i>"]
+    any_data = False
+    for asset in ASSET_LIST:
+        em = ASSET_EMOJI.get(asset, "")
+        rows = c.execute(
+            """SELECT correct, hold_instab, realized_vol FROM samples
+               WHERE settled_outcome IS NOT NULL AND asset=?
+                 AND ins_ts IS NOT NULL AND ins_ts >= ?""",
+            (asset, cutoff)).fetchall()
+        n = len(rows)
+        if n == 0:
+            continue
+        any_data = True
+        win = sum(r[0] for r in rows) / n * 100
+        # split by move-hold: steady (instab<0.03) vs unstable (>=0.06)
+        steady = [r for r in rows if r[1] is not None and r[1] < 0.03]
+        unstable = [r for r in rows if r[1] is not None and r[1] >= 0.06]
+        def wr(rs): return (sum(r[0] for r in rs)/len(rs)*100) if rs else None
+        sw, uw = wr(steady), wr(unstable)
+        line = f"{em} <b>{asset}</b>: {win:.0f}% ({n})"
+        bits = []
+        if sw is not None:
+            bits.append(f"steady {sw:.0f}%({len(steady)})")
+        if uw is not None:
+            bits.append(f"unstable {uw:.0f}%({len(unstable)})")
+        if bits:
+            line += " · " + " · ".join(bits)
+        L.append(line)
+    conn.close()
+    if not any_data:
+        L.append("\n<i>no settled windows in the last hour yet.</i>")
+    L.append(f"\n🕐 {est_str()}")
+    return "\n".join(L)
+
 
 def report_loop():
     while True:
@@ -628,6 +750,11 @@ def report_loop():
                         L.append("  ⚠️ no band cleared 99% hold")
             tg("📊 <b>LOCK FRONTIER · cumulative</b>\n<i>hold% = sign correct; >99% beats 99¢</i>\n\n"
                + "\n".join(L) + f"\n\n🧪 {len(rows)} settled samples · {withbook} w/ book · {est_str()}")
+            # Also send the LAST-HOUR digest (move-hold + volatility per asset).
+            try:
+                tg(build_hourly_digest())
+            except Exception as e:
+                log.error(f"[hourly digest] {e}")
         except Exception as e:
             log.error(f"[report] {e}")
 
@@ -942,6 +1069,81 @@ def build_split_report():
     return "\n".join(L)
 
 
+def build_wobble_report():
+    """THE METRIC SHOOTOUT: at the marginal zones where the bot loses, compare all
+    three chaos measures (jitter, CHOP, KER) between WINNING and LOSING windows.
+    Whichever shows the biggest, most consistent gap between winners and losers is
+    the one actually worth gating on. If none separate them, no wobble filter helps
+    — same logic as /split, but head-to-head across the three candidates."""
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    zones = [
+        ("small move, buzzer (0.03-0.08%, 0-20s)", 0.03, 0.08, 0, 20),
+        ("small move, 20-40s (0.04-0.10%)",        0.04, 0.10, 20, 40),
+        ("moderate move, early (0.08-0.20%, 40-70s)", 0.08, 0.20, 40, 70),
+    ]
+    L = ["🌀 <b>WOBBLE SHOOTOUT — jitter vs CHOP vs KER</b>",
+         "<i>which one separates winners from losers? (loser value should differ)</i>",
+         "<i>jitter/CHOP: losers HIGHER · KER: losers LOWER</i>", ""]
+    diag = c.execute(
+        """SELECT
+             SUM(CASE WHEN settled_outcome IS NOT NULL AND jitter IS NOT NULL THEN 1 ELSE 0 END),
+             SUM(CASE WHEN settled_outcome IS NOT NULL AND chop IS NOT NULL THEN 1 ELSE 0 END),
+             SUM(CASE WHEN settled_outcome IS NOT NULL AND ker IS NOT NULL THEN 1 ELSE 0 END)
+           FROM samples""").fetchone()
+    L.append(f"<i>settled w/ jitter:{diag[0] or 0} · chop:{diag[1] or 0} · ker:{diag[2] or 0}</i>")
+    if (diag[0] or 0) == 0:
+        L.append("\n⚠️ No jitter/chop/ker data yet — gathered going forward.")
+        L.append("Let it run and re-check /wobble in a day.")
+        L.append(f"\n🕐 {est_str()}")
+        conn.close()
+        return "\n".join(L)
+    L.append("")
+    for label, mlo, mhi, slo, shi in zones:
+        rows = c.execute(
+            """SELECT correct, jitter, chop, ker FROM samples
+               WHERE settled_outcome IS NOT NULL
+                 AND jitter IS NOT NULL
+                 AND ABS(binance_move) >= ? AND ABS(binance_move) < ?
+                 AND secs_left >= ? AND secs_left < ?""",
+            (mlo, mhi, slo, shi)).fetchall()
+        if not rows:
+            L.append(f"<b>{label}</b>\n  no samples yet\n")
+            continue
+        wins = [r for r in rows if r[0] == 1]
+        loss = [r for r in rows if r[0] == 0]
+        n, nl = len(rows), len(loss)
+        hold = len(wins) / n * 100 if n else 0
+        def avg(rs, i):
+            vals = [r[i] for r in rs if r[i] is not None]
+            return sum(vals) / len(vals) if vals else 0
+        L.append(f"<b>{label}</b>")
+        L.append(f"  hold {hold:.1f}% · {n} samp · {nl} losses")
+        wj, lj = avg(wins, 1), avg(loss, 1)
+        wc, lc = avg(wins, 2), avg(loss, 2)
+        wk, lk = avg(wins, 3), avg(loss, 3)
+        L.append(f"  jitter: win {wj:.4f} vs <b>loss {lj:.4f}</b>")
+        L.append(f"  CHOP:   win {wc:.1f} vs <b>loss {lc:.1f}</b>")
+        L.append(f"  KER:    win {wk:.4f} vs <b>loss {lk:.4f}</b>")
+        if nl >= 5:
+            # which metric shows the biggest relative separation?
+            def gap(w, l):
+                return abs(l - w) / w * 100 if w else 0
+            gj, gc, gk = gap(wj, lj), gap(wc, lc), gap(wk, lk)
+            best = max([("jitter", gj), ("CHOP", gc), ("KER", gk)], key=lambda x: x[1])
+            if best[1] > 25:
+                L.append(f"  → <b>{best[0]}</b> separates best ({best[1]:.0f}% gap) ✅")
+            else:
+                L.append(f"  → none separate well (best {best[0]} {best[1]:.0f}%) ✗")
+        else:
+            L.append(f"  → too few losses ({nl}) to judge yet")
+        L.append("")
+    conn.close()
+    L.append("<i>The metric with the biggest, most consistent win/loss gap across")
+    L.append("zones is the one worth gating on. If none separate, skip the filter.</i>")
+    L.append(f"\n🕐 {est_str()}")
+    return "\n".join(L)
+
+
 def build_book_report():
     """The execution-gap answer: in the buckets that were both LOCKED and had time
     to act, what was the actual ask price, and was there depth at ≤99¢? This is what
@@ -1008,6 +1210,8 @@ def command_worker():
                         tg(build_book_report())
                     elif text == "/split":
                         tg(build_split_report())
+                    elif text == "/wobble":
+                        tg(build_wobble_report())
                     elif text.startswith("/grid"):
                         parts = text.split()
                         asset = parts[1].upper() if len(parts) > 1 else "BTC"
