@@ -1152,6 +1152,88 @@ def build_wobble_report(asset=None):
     return "\n".join(L)
 
 
+def build_past_threshold_report(asset=None):
+    """THE RIGHT TEST (Savio's idea): only look at windows that ALREADY CLEARED the
+    move threshold — i.e. trades the bot would actually take — then bucket THOSE by
+    chaos (jitter/CHOP/KER) and show win%. Every prior report mixed in tiny-move
+    calm windows that lose for a different reason (small move), which made chaos
+    look backwards. By first filtering to past-threshold windows, move size is held
+    roughly constant, so we finally see whether — AMONG REAL TRADES — the choppy
+    ones lose more than the smooth ones. If they do, a chaos filter helps. If not,
+    it's settled: chaos adds nothing beyond the move×time gate.
+
+    'Past threshold' here = the move cleared a per-time-left bar (approximating the
+    bot's frontier): >=0.10% at <=20s, >=0.10% at 20-40s, >=0.20% at 40-70s,
+    >=0.40% at 70-120s. Tunable, but this matches the measured lock frontier."""
+    if asset is not None and asset not in ASSET_LIST:
+        return f"Unknown asset '{asset}'. Try: {', '.join(ASSET_LIST)}"
+    # per-time-left move bar (the "would the bot trade this" gate, measured frontier)
+    # (max_secs_left, min_abs_move%)
+    gate = [(20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)]
+    # SQL CASE that picks the bar for each row's secs_left
+    gate_sql = """
+        ABS(binance_move) >= (CASE
+            WHEN secs_left <= 20 THEN 0.10
+            WHEN secs_left <= 40 THEN 0.10
+            WHEN secs_left <= 70 THEN 0.20
+            ELSE 0.40 END)
+        AND secs_left <= 120 AND secs_left >= 0
+    """
+    asset_sql = " AND asset=?" if asset else ""
+    scope = f"{ASSET_EMOJI.get(asset,'')} {asset}" if asset else "ALL markets"
+    # jitter buckets (the metric that won Savio's shape test). Tunable edges.
+    jit_buckets = [
+        ("calm    (jit under 0.15)", 0.0,  0.15),
+        ("mild    (0.15-0.30)",       0.15, 0.30),
+        ("choppy  (0.30-0.60)",       0.30, 0.60),
+        ("wild    (over 0.60)",       0.60, 999),
+    ]
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    out = [f"🎯 <b>PAST-THRESHOLD chaos — {scope}</b>",
+           "<i>only windows the bot would TRADE (move cleared gate),</i>",
+           "<i>then bucketed by jitter. does choppy lose AMONG real trades?</i>"]
+    # how many past-threshold settled rows exist?
+    base_params = ((asset,) if asset else ())
+    n_pt = c.execute(
+        f"""SELECT COUNT(*) FROM samples
+            WHERE settled_outcome IS NOT NULL AND jitter IS NOT NULL{asset_sql}
+              AND {gate_sql}""", base_params).fetchone()[0]
+    out.append(f"<i>past-threshold settled w/ jitter: {n_pt}</i>")
+    if n_pt == 0:
+        out.append("\n⚠️ No past-threshold rows with jitter yet.")
+        out.append("Needs windows that cleared the gate AND have the new jitter")
+        out.append("column (gathered going forward). Re-check in a day.")
+        out.append(f"\n🕐 {est_str()}")
+        conn.close()
+        return "\n".join(out)
+    for tf in (5, 15):
+        out.append(f"\n<b>━━ {asset or 'ALL'} {tf}m · past-threshold ━━</b>")
+        any_rows = False
+        for label, lo, hi in jit_buckets:
+            rows = c.execute(
+                f"""SELECT correct FROM samples
+                    WHERE settled_outcome IS NOT NULL AND jitter IS NOT NULL{asset_sql}
+                      AND tf=? AND {gate_sql}
+                      AND jitter >= ? AND jitter < ?""",
+                (base_params + (tf, lo, hi))).fetchall()
+            n = len(rows)
+            if n == 0:
+                continue
+            any_rows = True
+            win = sum(r[0] for r in rows) / n * 100
+            flag = "✅" if win >= 99 else ("·" if win >= 97 else "⚠️")
+            out.append(f" {flag} {label}: {win:.1f}% ({n})")
+        if not any_rows:
+            out.append(" (no past-threshold samples yet)")
+    conn.close()
+    out.append("\n<i>KEY READ: these are all BIG-ENOUGH moves (past the gate), so")
+    out.append("move size is controlled. If win% now DROPS as jitter rises, chaos")
+    out.append("is a real independent signal — gate it. If win% is flat/climbs,")
+    out.append("chaos adds nothing beyond move×time (settled).</i>")
+    out.append(f"\n🕐 {est_str()}")
+    return "\n".join(out)
+
+
 def build_book_report():
     """The execution-gap answer: in the buckets that were both LOCKED and had time
     to act, what was the actual ask price, and was there depth at ≤99¢? This is what
@@ -1222,6 +1304,10 @@ def command_worker():
                         parts = text.split()
                         wb_asset = parts[1].upper() if len(parts) > 1 else None
                         tg(build_wobble_report(wb_asset))
+                    elif text.startswith("/past"):
+                        parts = text.split()
+                        pt_asset = parts[1].upper() if len(parts) > 1 else None
+                        tg(build_past_threshold_report(pt_asset))
                     elif text.startswith("/grid"):
                         parts = text.split()
                         asset = parts[1].upper() if len(parts) > 1 else "BTC"
