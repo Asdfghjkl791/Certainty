@@ -1107,43 +1107,43 @@ def build_wobble_report(asset=None):
         return "\n".join(L)
     L.append("")
     for label, mlo, mhi, slo, shi in zones:
-        rows = c.execute(
-            f"""SELECT correct, jitter, chop, ker FROM samples
-               WHERE settled_outcome IS NOT NULL
-                 AND jitter IS NOT NULL{asset_sql}
-                 AND ABS(binance_move) >= ? AND ABS(binance_move) < ?
-                 AND secs_left >= ? AND secs_left < ?""",
-            (((asset,) if asset else ()) + (mlo, mhi, slo, shi))).fetchall()
-        if not rows:
-            L.append(f"<b>{label}</b>\n  no samples yet\n")
-            continue
-        wins = [r for r in rows if r[0] == 1]
-        loss = [r for r in rows if r[0] == 0]
-        n, nl = len(rows), len(loss)
-        hold = len(wins) / n * 100 if n else 0
-        def avg(rs, i):
-            vals = [r[i] for r in rs if r[i] is not None]
-            return sum(vals) / len(vals) if vals else 0
-        L.append(f"<b>{label}</b>")
-        L.append(f"  hold {hold:.1f}% · {n} samp · {nl} losses")
-        wj, lj = avg(wins, 1), avg(loss, 1)
-        wc, lc = avg(wins, 2), avg(loss, 2)
-        wk, lk = avg(wins, 3), avg(loss, 3)
-        L.append(f"  jitter: win {wj:.4f} vs <b>loss {lj:.4f}</b>")
-        L.append(f"  CHOP:   win {wc:.1f} vs <b>loss {lc:.1f}</b>")
-        L.append(f"  KER:    win {wk:.4f} vs <b>loss {lk:.4f}</b>")
-        if nl >= 5:
-            # which metric shows the biggest relative separation?
-            def gap(w, l):
-                return abs(l - w) / w * 100 if w else 0
-            gj, gc, gk = gap(wj, lj), gap(wc, lc), gap(wk, lk)
-            best = max([("jitter", gj), ("CHOP", gc), ("KER", gk)], key=lambda x: x[1])
-            if best[1] > 25:
-                L.append(f"  → <b>{best[0]}</b> separates best ({best[1]:.0f}% gap) ✅")
+        L.append(f"<b>━━ {label} ━━</b>")
+        for tf in (5, 15):
+            rows = c.execute(
+                f"""SELECT correct, jitter, chop, ker FROM samples
+                   WHERE settled_outcome IS NOT NULL
+                     AND jitter IS NOT NULL{asset_sql} AND tf=?
+                     AND ABS(binance_move) >= ? AND ABS(binance_move) < ?
+                     AND secs_left >= ? AND secs_left < ?""",
+                (((asset,) if asset else ()) + (tf, mlo, mhi, slo, shi))).fetchall()
+            if not rows:
+                L.append(f"  <b>{tf}m</b>: no samples yet")
+                continue
+            wins = [r for r in rows if r[0] == 1]
+            loss = [r for r in rows if r[0] == 0]
+            n, nl = len(rows), len(loss)
+            hold = len(wins) / n * 100 if n else 0
+            def avg(rs, i):
+                vals = [r[i] for r in rs if r[i] is not None]
+                return sum(vals) / len(vals) if vals else 0
+            L.append(f"  <b>{tf}m</b> · hold {hold:.1f}% · {n} samp · {nl} losses")
+            wj, lj = avg(wins, 1), avg(loss, 1)
+            wc, lc = avg(wins, 2), avg(loss, 2)
+            wk, lk = avg(wins, 3), avg(loss, 3)
+            L.append(f"    jitter: win {wj:.4f} vs <b>loss {lj:.4f}</b>")
+            L.append(f"    CHOP:   win {wc:.1f} vs <b>loss {lc:.1f}</b>")
+            L.append(f"    KER:    win {wk:.4f} vs <b>loss {lk:.4f}</b>")
+            if nl >= 5:
+                def gap(w, l):
+                    return abs(l - w) / w * 100 if w else 0
+                gj, gc, gk = gap(wj, lj), gap(wc, lc), gap(wk, lk)
+                best = max([("jitter", gj), ("CHOP", gc), ("KER", gk)], key=lambda x: x[1])
+                if best[1] > 25:
+                    L.append(f"    → <b>{best[0]}</b> separates best ({best[1]:.0f}% gap) ✅")
+                else:
+                    L.append(f"    → none separate well (best {best[0]} {best[1]:.0f}%) ✗")
             else:
-                L.append(f"  → none separate well (best {best[0]} {best[1]:.0f}%) ✗")
-        else:
-            L.append(f"  → too few losses ({nl}) to judge yet")
+                L.append(f"    → too few losses ({nl}) to judge yet")
         L.append("")
     conn.close()
     L.append("<i>The metric with the biggest, most consistent win/loss gap across")
